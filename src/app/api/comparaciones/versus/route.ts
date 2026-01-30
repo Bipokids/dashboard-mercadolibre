@@ -3,6 +3,7 @@ import { db } from '@/lib/firebase';
 import { ref, get } from 'firebase/database';
 import { obtenerTokenValido, CuentaML } from '@/lib/mercadolibre';
 
+// --- HELPER 1: Fetch Auth ---
 async function fetchAuth(url: string, token: string) {
     try {
         const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
@@ -11,6 +12,7 @@ async function fetchAuth(url: string, token: string) {
     } catch (e) { return null; }
 }
 
+// --- HELPER 2: Fetch Público (Respaldo) ---
 async function fetchPublic(url: string) {
     try {
         const res = await fetch(url, { 
@@ -22,17 +24,6 @@ async function fetchPublic(url: string) {
         if (!res.ok) return null;
         return await res.json();
     } catch (e) { return null; }
-}
-
-// Función de respaldo matemático solo si el dato real viene en 0
-function estimarVentasPorPrecio(price: number) {
-    let base = 150;
-    if (price < 15000) base = 600;
-    else if (price < 40000) base = 350;
-    else if (price < 100000) base = 150;
-    else base = 50;
-    // Ruido aleatorio para realismo
-    return Math.floor(base * (0.8 + Math.random() * 0.4));
 }
 
 export async function POST(request: Request) {
@@ -67,114 +58,133 @@ export async function POST(request: Request) {
     const categoryData = await fetchAuth(`https://api.mercadolibre.com/categories/${categoryId}`, token);
     const categoryName = categoryData?.name || "Categoría";
 
-    console.log(`🥊 Versus: ${myItem.title} (${categoryId})`);
+    console.log(`🥊 Buscando rival para: "${myItem.title}"`);
 
-    // 3. BUSCAR RIVAL
-    let rivalId = null;
-    let rivalType = 'item'; 
+    // 3. BUSCAR RIVAL (Estrategia: "El Mejor Dato Gana")
+    // Probamos varias estrategias en orden. La primera que devuelva un rival con PRECIO > 0 gana.
+    
+    let candidates: any[] = [];
 
-    // A. Highlights
+    // A. ESTRATEGIA TÍTULO (Keywords): Busca competencia directa real (Items)
+    // Usamos las primeras 3 palabras clave del título. Esto suele traer items activos con precio.
+    const keywords = myItem.title.split(' ').slice(0, 3).join(' ');
+    const searchTitleUrl = `https://api.mercadolibre.com/sites/MLA/search?q=${encodeURIComponent(keywords)}&sort=sold_quantity_desc&limit=5`;
+    const searchTitle = await fetchAuth(searchTitleUrl, token);
+    if (searchTitle && searchTitle.results) candidates.push(...searchTitle.results);
+
+    // B. ESTRATEGIA HIGHLIGHTS: Líderes oficiales de la categoría
     const highlights = await fetchAuth(`https://api.mercadolibre.com/highlights/MLA/category/${categoryId}`, token);
     if (highlights && highlights.content) {
-        const top = highlights.content.find((i: any) => {
-             const id = i.id || i.content?.id;
-             return id && id !== itemId;
-        });
-        if (top) rivalId = top.id || top.content?.id;
+        // Normalizamos la estructura rara de highlights
+        const hlItems = highlights.content.map((h: any) => h.content || h).filter((h: any) => h.id);
+        candidates.push(...hlItems);
     }
 
-    // B. Public Search (Respaldo)
-    if (!rivalId) {
-        const searchUrl = `https://api.mercadolibre.com/sites/MLA/search?q=${encodeURIComponent(categoryName)}&limit=5`;
-        const publicSearch = await fetchPublic(searchUrl);
-        if (publicSearch && publicSearch.results) {
-            const top = publicSearch.results.find((i: any) => i.id !== itemId);
-            if (top) rivalId = top.id;
+    // C. ESTRATEGIA CATEGORÍA: Búsqueda general en el nicho
+    const searchCatUrl = `https://api.mercadolibre.com/sites/MLA/search?category=${categoryId}&sort=sold_quantity_desc&limit=5`;
+    const searchCat = await fetchAuth(searchCatUrl, token);
+    if (searchCat && searchCat.results) candidates.push(...searchCat.results);
+
+    // FILTRADO INTELIGENTE
+    // 1. Quitamos nuestro propio producto.
+    // 2. Quitamos duplicados.
+    // 3. Priorizamos los que tienen "sold_quantity" alto.
+    let bestRivalId = null;
+
+    const uniqueCandidates = Array.from(new Map(candidates.map(item => [item.id, item])).values())
+        .filter((i: any) => i.id !== itemId); // Sacarme a mí mismo
+
+    // Iteramos candidatos para encontrar uno VÁLIDO (que tenga precio accesible)
+    for (const candidate of uniqueCandidates) {
+        // Si ya viene con precio y ventas en la búsqueda (es un Item), es el mejor candidato.
+        if (candidate.price > 0 && candidate.domain_id) { // domain_id suele indicar Item
+             bestRivalId = candidate.id;
+             console.log(`✅ Rival Item encontrado: ${bestRivalId} ($${candidate.price})`);
+             break; 
         }
+        
+        // Si es sospechoso de ser catálogo (sin precio claro en search), lo verificamos después,
+        // pero guardamos el primero como backup.
+        if (!bestRivalId) bestRivalId = candidate.id;
     }
 
-    if (!rivalId) return NextResponse.json({ success: false, error: 'No se encontraron competidores reales.' });
+    if (!bestRivalId) return NextResponse.json({ success: false, error: 'No se encontraron competidores.' });
 
-    // 4. OBTENER DETALLES DEL RIVAL
+    // 4. OBTENER DETALLE Y EXTRAER DATOS (Deep Parsing)
     let rivalFinal: any = null;
+    let rivalType = 'item';
+
+    // Intentamos leerlo como Item primero
+    rivalFinal = await fetchAuth(`https://api.mercadolibre.com/items/${bestRivalId}`, token);
     
-    // Intento A: Item
-    rivalFinal = await fetchAuth(`https://api.mercadolibre.com/items/${rivalId}`, token);
-    
-    // Intento B: Producto de Catálogo
-    if (!rivalFinal || rivalFinal.error) {
-        console.log(`⚠️ Falló item ${rivalId}, probando como Producto de Catálogo...`);
-        rivalFinal = await fetchAuth(`https://api.mercadolibre.com/products/${rivalId}`, token);
-        rivalType = 'product'; 
+    // Si falla o parece catálogo roto, probamos endpoint de productos
+    if (!rivalFinal || rivalFinal.error || rivalFinal.status === 'not_found') {
+        console.log(`⚠️ Item ${bestRivalId} falló, probando endpoint Productos...`);
+        rivalFinal = await fetchAuth(`https://api.mercadolibre.com/products/${bestRivalId}`, token);
+        rivalType = 'product';
     }
 
-    // Intento C: Público
+    // Si sigue fallando, intento público
     if (!rivalFinal || rivalFinal.error) {
-        rivalFinal = await fetchPublic(`https://api.mercadolibre.com/items/${rivalId}`);
+        rivalFinal = await fetchPublic(`https://api.mercadolibre.com/items/${bestRivalId}`);
         rivalType = 'item';
     }
 
     if (!rivalFinal || rivalFinal.error) {
-        return NextResponse.json({ success: false, error: 'El competidor encontrado no está accesible.' });
+        return NextResponse.json({ success: false, error: 'Datos del competidor no accesibles.' });
     }
 
-    // 5. NORMALIZACIÓN DE DATOS (CORREGIDA)
-    let rivalPrice = 0;
-    let rivalThumb = '';
-    let rivalTitle = '';
-    let rivalLink = '';
-    let rivalSold = 0;
+    // 5. NORMALIZACIÓN (Extraer Precio a toda costa)
+    let rPrice = 0;
+    let rThumb = '';
+    let rTitle = '';
+    let rLink = '';
+    let rSold = 0;
 
     if (rivalType === 'product') {
-        // --- LÓGICA DE CATÁLOGO ---
-        rivalTitle = rivalFinal.name;
+        rTitle = rivalFinal.name;
+        rThumb = rivalFinal.pictures?.[0]?.url || rivalFinal.picture_url || '';
         
-        // Foto: Catálogo usa 'pictures' (array), Items usan 'thumbnail'
-        rivalThumb = rivalFinal.pictures?.[0]?.url || rivalFinal.picture_url || '';
-        
-        // Precio: Buscamos en varios lugares porque ML lo esconde
+        // BUSCADOR DE PRECIOS AVANZADO PARA CATÁLOGO
         if (rivalFinal.buy_box_winner?.price) {
-            rivalPrice = rivalFinal.buy_box_winner.price;
+            rPrice = rivalFinal.buy_box_winner.price;
         } else if (rivalFinal.price_aggregator?.min_price) {
-            rivalPrice = rivalFinal.price_aggregator.min_price;
-        } else {
-            rivalPrice = 0;
-        }
-
-        // Link: Si no viene permalink, lo construimos MANUALMENTE para evitar errores
-        // La estructura oficial es: mercadolibre.com.ar/p/ID
-        if (rivalFinal.permalink) {
-            rivalLink = rivalFinal.permalink;
-        } else {
-            rivalLink = `https://www.mercadolibre.com.ar/p/${rivalFinal.id}`;
+            rPrice = rivalFinal.price_aggregator.min_price;
+        } else if (rivalFinal.price_aggregator?.average_price) {
+            rPrice = rivalFinal.price_aggregator.average_price;
         }
         
-        // Ventas
-        rivalSold = rivalFinal.sold_quantity || 0;
-
+        rLink = rivalFinal.permalink || `https://www.mercadolibre.com.ar/p/${rivalFinal.id}`;
+        rSold = rivalFinal.sold_quantity || 0;
     } else {
-        // --- LÓGICA DE ÍTEM NORMAL ---
-        rivalTitle = rivalFinal.title;
-        rivalThumb = rivalFinal.thumbnail || rivalFinal.secure_thumbnail;
-        rivalPrice = rivalFinal.price || 0;
-        rivalLink = rivalFinal.permalink;
-        rivalSold = rivalFinal.sold_quantity || 0;
+        rTitle = rivalFinal.title;
+        rThumb = rivalFinal.thumbnail || rivalFinal.secure_thumbnail;
+        rPrice = rivalFinal.price || 0;
+        rLink = rivalFinal.permalink;
+        rSold = rivalFinal.sold_quantity || 0;
     }
 
-    // CORRECCIÓN FINAL: Si el link sigue vacío, forzamos uno de búsqueda
-    if (!rivalLink) {
-        rivalLink = `https://listado.mercadolibre.com.ar/${rivalTitle.replace(/\s+/g, '-')}`;
+    // Failsafe Link
+    if (!rLink || rLink === '#') {
+        rLink = `https://listado.mercadolibre.com.ar/${rTitle.replace(/\s+/g, '-')}`;
     }
 
-    // CORRECCIÓN FINAL: Si precio o ventas son 0 (bloqueo), estimamos solo esos campos
-    // para no mostrar una tarjeta rota, pero usando el producto REAL encontrado.
-    if (rivalPrice === 0 && myItem.price) {
-        // Asumimos un precio similar al tuyo (-10%) si no podemos leerlo
-        rivalPrice = myItem.price * 0.9;
-    }
-    
-    if (rivalSold === 0) {
-        rivalSold = estimarVentasPorPrecio(rivalPrice || myItem.price);
+    // --- CORRECCIÓN FINAL POR SI EL RIVAL ELEGIDO TENÍA PRECIO 0 ---
+    // Si después de todo, el precio sigue siendo 0 (catálogo vacío), activamos el plan de emergencia:
+    // "Buscar Item por Título Exacto del Rival". 
+    // Esto encuentra una publicación de un vendedor real vendiendo ese producto.
+    if (rPrice === 0) {
+        console.log("⚠️ Rival tiene Precio $0. Buscando publicación alternativa...");
+        const altSearchUrl = `https://api.mercadolibre.com/sites/MLA/search?q=${encodeURIComponent(rTitle)}&sort=sold_quantity_desc&limit=1`;
+        const altSearch = await fetchAuth(altSearchUrl, token);
+        
+        if (altSearch && altSearch.results && altSearch.results.length > 0) {
+            const altItem = altSearch.results[0];
+            rPrice = altItem.price; // Este sí tiene precio
+            rLink = altItem.permalink;
+            rThumb = altItem.thumbnail;
+            console.log(`✅ Precio recuperado de item alternativo: $${rPrice}`);
+        }
     }
 
     return NextResponse.json({
@@ -191,12 +201,12 @@ export async function POST(request: Request) {
                 condition: myItem.condition
             },
             rival: {
-                id: rivalFinal.id,
-                title: rivalTitle,
-                price: rivalPrice,
-                thumbnail: rivalThumb,
-                permalink: rivalLink,
-                sold_quantity: rivalSold,
+                id: bestRivalId,
+                title: rTitle,
+                price: rPrice,
+                thumbnail: rThumb,
+                permalink: rLink,
+                sold_quantity: rSold,
                 condition: rivalFinal.condition
             }
         }
