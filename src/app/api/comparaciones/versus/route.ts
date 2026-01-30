@@ -3,7 +3,6 @@ import { db } from '@/lib/firebase';
 import { ref, get } from 'firebase/database';
 import { obtenerTokenValido, CuentaML } from '@/lib/mercadolibre';
 
-// --- HELPER: Fetch Auth ---
 async function fetchAuth(url: string, token: string) {
     try {
         const res = await fetch(url, { 
@@ -38,7 +37,7 @@ export async function POST(request: Request) {
     const token = await obtenerTokenValido(cuenta);
     if (!token) return NextResponse.json({ success: false, error: 'Auth falló' }, { status: 401 });
 
-    // 2. OBTENER TU PRODUCTO (Datos Reales)
+    // 2. OBTENER TU PRODUCTO
     const myItem = await fetchAuth(`https://api.mercadolibre.com/items/${itemId}`, token);
     if (!myItem) return NextResponse.json({ success: false, error: 'Producto no encontrado' }, { status: 404 });
 
@@ -46,39 +45,42 @@ export async function POST(request: Request) {
     const categoryData = await fetchAuth(`https://api.mercadolibre.com/categories/${categoryId}`, token);
     const categoryName = categoryData?.name || "Categoría";
 
-    // 3. BUSCAR RIVAL REAL (Estrategia: Mismo Título)
-    // Buscamos competidores que usen palabras clave similares a las tuyas.
-    // Esto suele devolver resultados reales y comparables.
-    const searchUrl = `https://api.mercadolibre.com/sites/MLA/search?q=${encodeURIComponent(myItem.title)}&limit=15`;
+    // 3. BUSCAR AL #1 DE LA CATEGORÍA (Rival Real)
+    // En lugar de buscar por título, pedimos el Top Seller del nicho.
+    // Esto casi siempre devuelve un resultado real.
+    const searchUrl = `https://api.mercadolibre.com/sites/MLA/search?category=${categoryId}&sort=sold_quantity_desc&limit=3`;
     const search = await fetchAuth(searchUrl, token);
     
     let rivalData = null;
 
     if (search && search.results) {
-        // Filtramos: 
-        // 1. Que no sea yo (id distinto).
-        // 2. Que tenga ventas > 0 (si la API las muestra).
-        // 3. Ordenamos por mayor venta real.
-        const competitors = search.results
-            .filter((i: any) => i.id !== itemId) // Sacamos mi producto
-            .sort((a: any, b: any) => (b.sold_quantity || 0) - (a.sold_quantity || 0));
+        // Tomamos el primer resultado que NO seas vos
+        rivalData = search.results.find((i: any) => i.id !== itemId);
+    }
 
-        if (competitors.length > 0) {
-            // Tomamos al líder de la búsqueda
-            rivalData = competitors[0];
+    // 4. SI NO HAY RIVAL (Ni siquiera por categoría)
+    // Aquí es donde aceptamos la derrota si ML bloquea todo.
+    if (!rivalData) {
+        // INTENTO DESESPERADO: Buscar por texto de la categoría (último recurso real)
+        const fallbackUrl = `https://api.mercadolibre.com/sites/MLA/search?q=${encodeURIComponent(categoryName)}&sort=sold_quantity_desc&limit=3`;
+        const fallbackSearch = await fetchAuth(fallbackUrl, token);
+        if (fallbackSearch && fallbackSearch.results) {
+             rivalData = fallbackSearch.results.find((i: any) => i.id !== itemId);
         }
     }
 
-    // 4. SI NO HAY RIVAL O DATOS REALES, CORTAMOS ACÁ.
-    // No inventamos rival genérico.
     if (!rivalData) {
         return NextResponse.json({
             success: false, 
-            error: 'No se encontraron competidores con datos públicos disponibles.'
+            error: 'Mercado Libre no devolvió datos de competidores para esta categoría.'
         });
     }
 
-    // 5. PREPARAR RESPUESTA (Solo datos crudos)
+    // 5. DETALLE FINAL DEL RIVAL (Para asegurar datos frescos)
+    // A veces la búsqueda no trae todo, consultamos el item específico
+    const fullRival = await fetchAuth(`https://api.mercadolibre.com/items/${rivalData.id}`, token);
+    const rivalFinal = fullRival || rivalData;
+
     return NextResponse.json({
         success: true,
         data: {
@@ -89,17 +91,19 @@ export async function POST(request: Request) {
                 price: myItem.price,
                 thumbnail: myItem.thumbnail,
                 permalink: myItem.permalink,
-                sold_quantity: myItem.sold_quantity || 0, // Dato real o 0
+                sold_quantity: myItem.sold_quantity || 0,
                 condition: myItem.condition
             },
             rival: {
-                id: rivalData.id,
-                title: rivalData.title,
-                price: rivalData.price,
-                thumbnail: rivalData.thumbnail,
-                permalink: rivalData.permalink,
-                sold_quantity: rivalData.sold_quantity || 0, // Dato real o 0. NADA DE ESTIMACIONES.
-                condition: rivalData.condition
+                id: rivalFinal.id,
+                title: rivalFinal.title,
+                price: rivalFinal.price,
+                thumbnail: rivalFinal.thumbnail || rivalFinal.secure_thumbnail,
+                permalink: rivalFinal.permalink,
+                // Si ML oculta ventas (0), mostramos 0. NO INVENTAMOS.
+                // Pero al ser el #1 de la búsqueda, es el dato real disponible.
+                sold_quantity: rivalFinal.sold_quantity || 0, 
+                condition: rivalFinal.condition
             }
         }
     });
