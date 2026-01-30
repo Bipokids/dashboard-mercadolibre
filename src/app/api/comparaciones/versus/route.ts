@@ -3,7 +3,6 @@ import { db } from '@/lib/firebase';
 import { ref, get } from 'firebase/database';
 import { obtenerTokenValido, CuentaML } from '@/lib/mercadolibre';
 
-// --- HELPER 1: Fetch Auth (Tu Credencial) ---
 async function fetchAuth(url: string, token: string) {
     try {
         const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
@@ -12,8 +11,6 @@ async function fetchAuth(url: string, token: string) {
     } catch (e) { return null; }
 }
 
-// --- HELPER 2: Fetch Público (Respaldo Vercel) ---
-// Usa headers de navegador para intentar pasar desapercibido
 async function fetchPublic(url: string) {
     try {
         const res = await fetch(url, { 
@@ -63,8 +60,9 @@ export async function POST(request: Request) {
 
     // 3. BUSCAR RIVAL (Estrategia Multicapa)
     let rivalId = null;
+    let rivalType = 'item'; // 'item' o 'product'
 
-    // A. INTENTO 1: Highlights con Token (Oficial)
+    // A. INTENTO 1: Highlights (Oficial)
     const highlights = await fetchAuth(`https://api.mercadolibre.com/highlights/MLA/category/${categoryId}`, token);
     if (highlights && highlights.content) {
         const top = highlights.content.find((i: any) => {
@@ -73,63 +71,76 @@ export async function POST(request: Request) {
         });
         if (top) {
             rivalId = top.id || top.content?.id;
+            // Los IDs de catálogo suelen no tener "MLA" al principio o ser solo números, pero ML los mezcla.
+            // Asumimos 'item' y si falla cambiamos.
             console.log(`✅ Rival encontrado en Highlights: ${rivalId}`);
         }
     }
 
-    // B. INTENTO 2: Búsqueda Pública (Sin Token - Bypass de Escudo)
-    // Si highlights falló, intentamos buscar "desde afuera" aprovechando que estamos en Vercel.
+    // B. INTENTO 2: Búsqueda Pública
     if (!rivalId) {
-        console.log("⚠️ Highlights vacío. Intentando búsqueda pública...");
-        // Buscamos por nombre de categoría + "mas vendidos" implícito por relevancia
         const searchUrl = `https://api.mercadolibre.com/sites/MLA/search?q=${encodeURIComponent(categoryName)}&limit=5`;
         const publicSearch = await fetchPublic(searchUrl);
-        
         if (publicSearch && publicSearch.results) {
             const top = publicSearch.results.find((i: any) => i.id !== itemId);
-            if (top) {
-                rivalId = top.id;
-                console.log(`✅ Rival encontrado en Public Search: ${rivalId}`);
-            }
+            if (top) rivalId = top.id;
         }
     }
 
-    // C. INTENTO 3: Búsqueda por Título (Último recurso)
-    if (!rivalId) {
-        const shortTitle = myItem.title.split(' ').slice(0, 2).join(' '); // 2 palabras clave
-        const searchUrl = `https://api.mercadolibre.com/sites/MLA/search?q=${encodeURIComponent(shortTitle)}&limit=5`;
-        const titleSearch = await fetchAuth(searchUrl, token); // Volvemos a Auth por si acaso
-        if (titleSearch && titleSearch.results) {
-             const top = titleSearch.results.find((i: any) => i.id !== itemId);
-             if (top) rivalId = top.id;
-        }
-    }
+    if (!rivalId) return NextResponse.json({ success: false, error: 'No se encontraron competidores reales.' });
 
-    if (!rivalId) {
-        return NextResponse.json({ success: false, error: 'No se encontraron competidores reales.' });
-    }
-
-    // 4. OBTENER DETALLES DEL RIVAL (Manejo de Error 404 - Catálogo)
-    let rivalFinal = null;
+    // 4. OBTENER DETALLES DEL RIVAL (Lógica "Traductor Universal")
+    let rivalFinal: any = null;
     
-    // Intento A: Como Ítem (Publicación normal)
+    // Intento A: Como Ítem
     rivalFinal = await fetchAuth(`https://api.mercadolibre.com/items/${rivalId}`, token);
     
-    // Intento B: Como Producto de Catálogo (Si el anterior dio 404 o error)
+    // Intento B: Como Producto de Catálogo (Si falla A)
     if (!rivalFinal || rivalFinal.error) {
         console.log(`⚠️ Falló item ${rivalId}, probando como Producto de Catálogo...`);
         rivalFinal = await fetchAuth(`https://api.mercadolibre.com/products/${rivalId}`, token);
+        rivalType = 'product'; // Marcamos que es catálogo
     }
 
-    // Si aún así falla, intentamos público
+    // Intento C: Fetch Público
     if (!rivalFinal || rivalFinal.error) {
-        console.log(`⚠️ Falló Auth, probando fetch público para ${rivalId}...`);
         rivalFinal = await fetchPublic(`https://api.mercadolibre.com/items/${rivalId}`);
+        rivalType = 'item';
     }
 
     if (!rivalFinal || rivalFinal.error) {
-        console.error(`❌ Imposible obtener detalle de ${rivalId}`);
         return NextResponse.json({ success: false, error: 'El competidor encontrado no está accesible.' });
+    }
+
+    // 5. NORMALIZACIÓN DE DATOS (Aquí ocurre la magia)
+    let rivalPrice = 0;
+    let rivalThumb = '';
+    let rivalTitle = '';
+    let rivalLink = '';
+
+    if (rivalType === 'product') {
+        // --- LÓGICA DE CATÁLOGO ---
+        rivalTitle = rivalFinal.name;
+        // La foto suele estar en 'pictures'
+        rivalThumb = rivalFinal.pictures && rivalFinal.pictures.length > 0 
+            ? rivalFinal.pictures[0].url 
+            : (rivalFinal.picture_url || '');
+        
+        // El precio está en 'buy_box_winner' (el vendedor que gana la venta)
+        if (rivalFinal.buy_box_winner) {
+            rivalPrice = rivalFinal.buy_box_winner.price;
+            rivalLink = `https://www.mercadolibre.com.ar/p/${rivalFinal.id}`; // Link al producto
+        } else {
+            // Si no hay ganador, buscamos en rango de precios
+            rivalPrice = rivalFinal.price_aggregator?.min_price || 0;
+            rivalLink = rivalFinal.permalink;
+        }
+    } else {
+        // --- LÓGICA DE ÍTEM NORMAL ---
+        rivalTitle = rivalFinal.title;
+        rivalThumb = rivalFinal.thumbnail || rivalFinal.secure_thumbnail;
+        rivalPrice = rivalFinal.price;
+        rivalLink = rivalFinal.permalink;
     }
 
     return NextResponse.json({
@@ -147,18 +158,17 @@ export async function POST(request: Request) {
             },
             rival: {
                 id: rivalFinal.id,
-                title: rivalFinal.title || rivalFinal.name, // Productos usan 'name'
-                price: rivalFinal.price || 0, // Productos a veces no tienen precio directo (rango), cuidado aquí
-                thumbnail: rivalFinal.thumbnail || rivalFinal.secure_thumbnail || rivalFinal.picture_url,
-                permalink: rivalFinal.permalink,
-                sold_quantity: rivalFinal.sold_quantity || 0,
+                title: rivalTitle,
+                price: rivalPrice || 0, // Dato real
+                thumbnail: rivalThumb,
+                permalink: rivalLink,
+                sold_quantity: rivalFinal.sold_quantity || 0, // Dato real
                 condition: rivalFinal.condition
             }
         }
     });
 
   } catch (error: any) {
-    console.error("🔥 Error Critical:", error);
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }
 }
